@@ -22,7 +22,7 @@
 set -euo pipefail
 
 PROG="netmon-agent"
-VERSION="1.0.0"
+VERSION="1.1.0"
 INSTALL_DIR="/opt/traffic_routing"
 CONF_DIR="/etc/traffic_routing"
 STATE_DIR="/var/lib/traffic_monitor"
@@ -36,6 +36,11 @@ INIT="${INIT:-0}"
 NO_SERVICE="${NO_SERVICE:-0}"
 TOKEN="${TOKEN:-}"
 AGENT_TOKEN="${AGENT_TOKEN:-}"
+# 断网相关（v1.1.0）
+AUTO_BLOCK="${AUTO_BLOCK:-0}"
+BLOCK_TTL="${BLOCK_TTL:-0}"
+LIMIT_DIR="${LIMIT_DIR:-sum}"
+SSH_PORTS="${SSH_PORTS:-22}"
 
 C_OK=""  C_WARN=""  C_ERR=""  C_DIM=""  C_RST=""
 if [ -t 1 ] && [ "${NO_COLOR:-0}" != "1" ]; then
@@ -57,7 +62,8 @@ echo "  ${PROG} ${VERSION}  一键安装"
 echo "=============================================="
 echo "  监听地址   : ${BIND}"
 echo "  采样间隔   : ${INTERVAL}s"
-echo "  流量上限   : $( [ "$LIMIT" = "0" ] && echo '不限（仅统计）' || echo "${LIMIT} GB" )"
+echo "  流量上限   : $( [ "$LIMIT" = "0" ] && echo '不限（仅统计）' || echo "${LIMIT} GB（口径 ${LIMIT_DIR}）" )"
+echo "  自动断网   : $( [ "$AUTO_BLOCK" = "1" ] && echo "开（超限即断网，保留端口 ${SSH_PORTS}$( [ "$BLOCK_TTL" != "0" ] && echo "，${BLOCK_TTL}s 后自动恢复" )）" || echo '关' )"
 echo "  鉴权       : $( [ -n "$TOKEN" ] && echo '自定义 token' || { [ -n "$AGENT_TOKEN" ] && echo '由 agent_token 派生' || echo '无（仅回环）'; } )"
 echo "=============================================="
 echo
@@ -150,13 +156,30 @@ if [ "$NEED_TOKEN" = "1" ] && [ -z "$TOKEN" ]; then
      或改用默认的 127.0.0.1:8899 配合 SSH 隧道。"
 fi
 
+# ---------------------------------------------------------------- 断网后端检查
+if [ "$AUTO_BLOCK" = "1" ]; then
+    if command -v nft >/dev/null 2>&1; then
+        ok "断网后端：nft（独立表 inet tr_block，删表即恢复）"
+    elif command -v iptables >/dev/null 2>&1; then
+        ok "断网后端：iptables（独立链 TR_FWD / TR_OUT，删链即恢复）"
+    else
+        die "AUTO_BLOCK=1 但系统既没有 nft 也没有 iptables，无法断网。
+     先装一个:  apt-get install -y nftables"
+    fi
+elif ! command -v nft >/dev/null 2>&1 && ! command -v iptables >/dev/null 2>&1; then
+    warn "系统没有 nft/iptables，以后想开自动断网会失败（不影响流量统计）"
+fi
+
 # ---------------------------------------------------------------- 写配置
 cat > "$CONF_DIR/agent.json" <<EOF
 {
  "bind": "${BIND}",
  "limit_gb": ${LIMIT},
+ "limit_dir": "${LIMIT_DIR}",
  "interval": ${INTERVAL},
- "auto_block": false,
+ "auto_block": $( [ "$AUTO_BLOCK" = "1" ] && echo true || echo false ),
+ "block_ttl": ${BLOCK_TTL},
+ "ssh_ports": "${SSH_PORTS}",
  "token": "${TOKEN}"
 }
 EOF
@@ -262,6 +285,8 @@ if command -v systemctl >/dev/null 2>&1; then
     echo "    journalctl -u ${SERVICE_NAME} -f"
 fi
 echo "    curl -s http://${BIND}/status | python3 -m json.tool"
+echo "    ${PY} ${INSTALL_DIR}/netmon-agent.py --block 手动断网    # 危险：会断业务流量"
+echo "    ${PY} ${INSTALL_DIR}/netmon-agent.py --unblock          # 立即解除断网"
 echo "    bash ${INSTALL_DIR}/uninstall.sh                 # 卸载"
 echo "=============================================="
 echo

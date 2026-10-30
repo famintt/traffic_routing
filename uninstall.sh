@@ -32,6 +32,17 @@ fi
 
 pkill -f "[n]etmon-agent.py" 2>/dev/null && echo "  残留进程已清理"
 
+# 关键：如果处于断网状态，必须先撤规则再删程序，否则机器永久断网且无人能解
+if command -v nft >/dev/null 2>&1 && nft list table inet tr_block >/dev/null 2>&1; then
+    nft delete table inet tr_block 2>/dev/null && echo "  已撤销断网规则(nft inet tr_block)"
+fi
+if command -v iptables >/dev/null 2>&1; then
+    for _ in 1 2 3; do iptables -D OUTPUT -j TR_OUT 2>/dev/null || break; done
+    for _ in 1 2 3; do iptables -D FORWARD -j TR_FWD 2>/dev/null || break; done
+    iptables -F TR_OUT 2>/dev/null; iptables -X TR_OUT 2>/dev/null
+    iptables -F TR_FWD 2>/dev/null; iptables -X TR_FWD 2>/dev/null
+fi
+
 rm -rf "$INSTALL_DIR"
 echo "  程序目录已删除: $INSTALL_DIR"
 

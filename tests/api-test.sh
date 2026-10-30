@@ -1,6 +1,6 @@
 #!/bin/bash
 set -u
-cd /opt/traffic_routing
+cd /opt/traffic_routing || exit 1
 
 echo "=== 启动 agent (127.0.0.1:8899) ==="
 python3 netmon-agent.py --bind 127.0.0.1:8899 --interval 10 >/tmp/agent.log 2>&1 &
@@ -28,6 +28,15 @@ curl -s -X PUT --max-time 5 -H 'Content-Type: application/json' \
 echo "--- 非法值校验 ---"
 curl -s -X PUT --max-time 5 -H 'Content-Type: application/json' \
   -d '{"limit_gb":-5}' http://127.0.0.1:8899/config; echo
+curl -s -X PUT --max-time 5 -H 'Content-Type: application/json' \
+  -d '{"limit_dir":"bad"}' http://127.0.0.1:8899/config; echo
+curl -s -X PUT --max-time 5 -H 'Content-Type: application/json' \
+  -d '{"block_ttl":-1}' http://127.0.0.1:8899/config; echo
+
+echo "--- 新字段校验 (limit_dir / ssh_ports) ---"
+curl -s -X PUT --max-time 5 -H 'Content-Type: application/json' \
+  -d '{"limit_dir":"tx","ssh_ports":"22,2222"}' http://127.0.0.1:8899/config; echo
+curl -s --max-time 5 http://127.0.0.1:8899/status | python3 -c "import sys,json;d=json.load(sys.stdin);print('limit_dir=%s ssh_ports=%s fw=%s auto_block=%s blocked=%s'%(d['limit_dir'],d['ssh_ports'],d['fw'],d['auto_block'],d['blocked']))"
 
 echo "--- POST /reset ---"
 curl -s -X POST --max-time 5 http://127.0.0.1:8899/reset; echo

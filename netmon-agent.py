@@ -32,14 +32,16 @@ import json
 import logging
 import os
 import re
+import shutil
 import signal
 import socket
+import subprocess
 import sys
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 PROG = "netmon-agent"
 
 CONF_DIR = "/etc/traffic_routing"
@@ -56,8 +58,11 @@ VIRTUAL_RE = re.compile(
 
 DEFAULT_CONF = {
     "limit_gb": 0,          # 0 = 不限制（仅统计）
+    "limit_dir": "sum",     # 计费方向: sum(上下行合计) / tx(仅出站) / rx(仅入站)
     "interval": 60,         # 采样间隔秒
-    "auto_block": False,    # 预留：超限自动封网（当前版本不实现，固定 false）
+    "auto_block": False,    # 超限自动断网
+    "block_ttl": 0,         # 断网后多少秒自动解除（0=永久，用于生产；>0 用于试跑/防误封）
+    "ssh_ports": "22",      # 断网时保留的端口（逗号分隔），防止把自己锁在外面
     "token": "",            # 非回环监听时必须非空
     "bind": "127.0.0.1:8899",
 }
@@ -86,11 +91,18 @@ def load_json(path, default):
 
 
 def save_json(path, data):
-    """原子写入，避免进程被杀时留下半个文件。"""
+    """原子写入，避免进程被杀时留下半个文件。
+
+    写临时文件后 chmod 600 再 rename —— 否则每次重写都会把
+    安装脚本设好的 0600 权限（保护 token）冲掉。
+    """
     ensure_dir(os.path.dirname(path))
     tmp = path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=1)
+        f.flush()
+        os.fsync(f.fileno())
+    os.chmod(tmp, 0o600)
     os.replace(tmp, path)
 
 
@@ -116,6 +128,241 @@ def derive_token(agent_token):
     面板侧用同一算法现算，双方都不需要额外保存密钥。
     """
     return hmac.new(agent_token.encode("utf-8"), b"netmon-v1", hashlib.sha256).hexdigest()
+
+
+# --------------------------------------------------------------------------
+# 防火墙：超限断网
+#
+# 设计原则（最重要的一条）：绝不改动机器上已有的任何防火墙规则。
+#   nft      → 只建一个独立表 inet tr_block，删表即完全复原
+#   iptables → 只建独立链 TR_FWD / TR_OUT，删链即完全复原
+# 断网时**永远保留 SSH 端口**，否则会把自己锁在门外。
+# 建表用一次性事务提交，语法错误时 nft 会整批回滚，不会留下半套规则。
+# --------------------------------------------------------------------------
+FW_TABLE = "tr_block"
+FW_CHAIN_FWD = "ch_fwd"     # fwd / out 是 nft 保留字，链名只能另起
+FW_CHAIN_OUT = "ch_out"
+IPT_CHAIN_FWD = "TR_FWD"
+IPT_CHAIN_OUT = "TR_OUT"
+
+
+def fw_backend():
+    if shutil.which("nft"):
+        return "nft"
+    if shutil.which("iptables"):
+        return "iptables"
+    return ""
+
+
+def _run(cmd, payload=None, timeout=25):
+    try:
+        p = subprocess.run(cmd, input=payload, stdout=subprocess.PIPE,
+                           stderr=subprocess.PIPE, timeout=timeout)
+        return (p.returncode,
+                p.stdout.decode("utf-8", "replace").strip(),
+                p.stderr.decode("utf-8", "replace").strip())
+    except (OSError, subprocess.SubprocessError) as e:
+        return 127, "", str(e)
+
+
+def parse_ports(s):
+    """'22,2222,10000-10010' -> ['22','2222','10000-10010']"""
+    out = []
+    for part in str(s or "").replace(" ", ",").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            a, _, b = part.partition("-")
+            if a.isdigit() and b.isdigit():
+                out.append("%d-%d" % (int(a), int(b)))
+            continue
+        if part.isdigit():
+            out.append(str(int(part)))
+    return out or ["22"]
+
+
+def _nft_script(ports):
+    # 链名不能叫 fwd / out —— 这两个在 nft 里是保留字（fwd 是语句关键字），
+    # 会报 "unexpected fwd, expecting string or last"，加引号也没用，只能换名。
+    body = [
+        "table inet %s {" % FW_TABLE,
+        "    chain %s {" % FW_CHAIN_FWD,
+        "        type filter hook forward priority 10; policy accept;",
+        "        counter drop",
+        "    }",
+        "    chain %s {" % FW_CHAIN_OUT,
+        "        type filter hook output priority 10; policy accept;",
+        '        oifname "lo" accept',
+    ]
+    for p in ports:
+        body.append("        tcp sport %s accept" % p)
+        body.append("        tcp dport %s accept" % p)
+    body += [
+        "        counter drop",
+        "    }",
+        "}",
+    ]
+    return "\n".join(body) + "\n"
+
+
+def _iptables_cleanup():
+    for hook, chain in (("OUTPUT", IPT_CHAIN_OUT), ("FORWARD", IPT_CHAIN_FWD)):
+        for _ in range(5):
+            rc, _, _ = _run(["iptables", "-D", hook, "-j", chain])
+            if rc != 0:
+                break
+        _run(["iptables", "-F", chain])
+        _run(["iptables", "-X", chain])
+
+
+def fw_block(ports=("22",)):
+    """建立断网规则，返回 (ok, msg)。失败时保证不残留半套规则。"""
+    be = fw_backend()
+    if be == "nft":
+        pre = ""
+        rc, _, _ = _run(["nft", "list", "table", "inet", FW_TABLE])
+        if rc == 0:
+            pre = "delete table inet %s\n" % FW_TABLE
+        script = pre + _nft_script(ports)
+        rc, out, err = _run(["nft", "-f", "-"], payload=script.encode())
+        if rc != 0:
+            return False, "nft 应用失败: %s" % (err or out)
+        rc, listing, _ = _run(["nft", "list", "table", "inet", FW_TABLE])
+        if rc != 0:
+            return False, "nft 表校验失败"
+        missing = []
+        for p in ports:
+            if "tcp sport %s" % p not in listing:
+                missing.append("sport " + p)
+            if "tcp dport %s" % p not in listing:
+                missing.append("dport " + p)
+        if missing:
+            _run(["nft", "delete", "table", "inet", FW_TABLE])
+            return False, "自检失败(%s)，已回滚，未断网" % ",".join(missing)
+        return True, "nft 表 inet %s 已生效，保留端口 %s" % (FW_TABLE, ",".join(ports))
+
+    if be == "iptables":
+        _iptables_cleanup()
+        seq = [["iptables", "-N", IPT_CHAIN_OUT],
+               ["iptables", "-A", IPT_CHAIN_OUT, "-o", "lo", "-j", "ACCEPT"]]
+        for p in ports:
+            seq.append(["iptables", "-A", IPT_CHAIN_OUT, "-p", "tcp", "--sport", p, "-j", "ACCEPT"])
+            seq.append(["iptables", "-A", IPT_CHAIN_OUT, "-p", "tcp", "--dport", p, "-j", "ACCEPT"])
+        seq += [["iptables", "-A", IPT_CHAIN_OUT, "-j", "DROP"],
+                ["iptables", "-I", "OUTPUT", "1", "-j", IPT_CHAIN_OUT],
+                ["iptables", "-N", IPT_CHAIN_FWD],
+                ["iptables", "-A", IPT_CHAIN_FWD, "-j", "DROP"],
+                ["iptables", "-I", "FORWARD", "1", "-j", IPT_CHAIN_FWD]]
+        for cmd in seq:
+            rc, out, err = _run(cmd)
+            if rc != 0:
+                _iptables_cleanup()
+                return False, "iptables 失败(%s): %s" % (" ".join(cmd), err or out)
+        return True, "iptables 链 %s/%s 已生效" % (IPT_CHAIN_OUT, IPT_CHAIN_FWD)
+
+    return False, "系统既没有 nft 也没有 iptables，无法断网"
+
+
+def fw_unblock():
+    """撤销断网，返回 (ok, msg)。本身没断网也算成功。"""
+    be = fw_backend()
+    if be == "nft":
+        rc, out, err = _run(["nft", "delete", "table", "inet", FW_TABLE])
+        if rc == 0:
+            return True, "nft 表 inet %s 已删除" % FW_TABLE
+        blob = (err + out).lower()
+        if "no such file" in blob or "does not exist" in blob:
+            return True, "当前没有断网规则"
+        return False, "nft 删除失败: %s" % (err or out)
+    if be == "iptables":
+        _iptables_cleanup()
+        return True, "iptables 链已清除"
+    return False, "系统既没有 nft 也没有 iptables"
+
+
+def fw_active():
+    be = fw_backend()
+    if be == "nft":
+        rc, _, _ = _run(["nft", "list", "table", "inet", FW_TABLE])
+        return rc == 0
+    if be == "iptables":
+        rc, _, _ = _run(["iptables", "-C", "OUTPUT", "-j", IPT_CHAIN_OUT])
+        return rc == 0
+    return False
+
+
+def limit_bytes_of(conf):
+    try:
+        gb = float(conf.get("limit_gb") or 0)
+    except (TypeError, ValueError):
+        gb = 0.0
+    return int(gb * 1024 ** 3) if gb > 0 else 0
+
+
+def metric_bytes(st, conf):
+    """按 limit_dir 取用于判定的字节数。"""
+    d = str(conf.get("limit_dir") or "sum").lower()
+    rx = int(st.get("rx", 0))
+    tx = int(st.get("tx", 0))
+    if d == "tx":
+        return tx
+    if d == "rx":
+        return rx
+    return rx + tx
+
+
+def do_block(state, conf, reason="manual"):
+    ports = parse_ports(conf.get("ssh_ports"))
+    ok, msg = fw_block(ports)
+    if not ok:
+        log.error("断网失败: %s", msg)
+        return False, msg
+    st = state.snapshot()
+    now = time.time()
+    st["blocked"] = True
+    st["blocked_at"] = now
+    st["block_reason"] = reason
+    try:
+        ttl = int(conf.get("block_ttl") or 0)
+    except (TypeError, ValueError):
+        ttl = 0
+    st["block_expire"] = (now + ttl) if ttl > 0 else 0
+    state.save(st)
+    log.warning("已断网 [%s] %s", reason, msg)
+    return True, msg
+
+
+def do_unblock(state, reason="manual"):
+    ok, msg = fw_unblock()
+    if not ok:
+        log.error("解除断网失败: %s", msg)
+        return False, msg
+    st = state.snapshot()
+    st["blocked"] = False
+    st["blocked_at"] = 0
+    st["block_reason"] = ""
+    st["block_expire"] = 0
+    state.save(st)
+    log.warning("已解除断网 [%s] %s", reason, msg)
+    return True, msg
+
+
+def evaluate_block(state, st, conf):
+    """每次采样后判定：是否该断网 / 该自动恢复。"""
+    if not conf.get("auto_block"):
+        return
+    lb = limit_bytes_of(conf)
+    if lb <= 0:
+        return
+    used = metric_bytes(st, conf)
+    blocked = bool(st.get("blocked"))
+    if used >= lb and not blocked:
+        log.warning("流量超限: %s >= %s，触发自动断网",
+                    human_bytes(used), human_bytes(lb))
+        do_block(state, conf, "auto")
+    elif used < lb and blocked and st.get("block_reason") == "auto":
+        do_unblock(state, "auto-recover")
 
 
 # --------------------------------------------------------------------------
@@ -178,6 +425,10 @@ class State(object):
     def snapshot(self):
         with self.lock:
             return self._load()
+
+    def save(self, st):
+        with self.lock:
+            save_json(self.path, st)
 
     def init(self):
         """初始化：把快照设成当前值，当月累计清零。用于首次安装。"""
@@ -249,10 +500,9 @@ def make_status(st, ifaces, conf):
     rx = int(st.get("rx", 0))
     tx = int(st.get("tx", 0))
     limit_gb = float(conf.get("limit_gb") or 0)
-    limit_bytes = int(limit_gb * 1024 ** 3) if limit_gb > 0 else 0
-    # 计费口径：上下行相加（与上游 sum 一致）
-    used = rx + tx
-    pct = round(used * 100.0 / limit_bytes, 2) if limit_bytes else 0.0
+    lb = limit_bytes_of(conf)
+    metric = metric_bytes(st, conf)
+    pct = round(metric * 100.0 / lb, 2) if lb else 0.0
     return {
         "ok": True,
         "version": VERSION,
@@ -260,14 +510,26 @@ def make_status(st, ifaces, conf):
         "month": st.get("month", ""),
         "rx_bytes": rx,
         "tx_bytes": tx,
-        "used_bytes": used,
+        "used_bytes": rx + tx,          # 上下行合计（展示用）
+        "metric_bytes": metric,         # 按 limit_dir 取出的判定值
+        "limit_bytes": lb,
         "limit_gb": limit_gb,
+        "limit_dir": str(conf.get("limit_dir") or "sum"),
         "percent": pct,
         "updated": st.get("updated", 0),
         "interval": conf.get("interval", 60),
         "ifaces": ifaces,
         "archive": st.get("archive", {}),
         "uptime": _uptime(),
+        # 断网相关
+        "fw": fw_backend() or "none",
+        "auto_block": bool(conf.get("auto_block")),
+        "blocked": bool(st.get("blocked")),
+        "blocked_at": st.get("blocked_at", 0),
+        "block_reason": st.get("block_reason", ""),
+        "block_expire": st.get("block_expire", 0),
+        "block_ttl": conf.get("block_ttl", 0),
+        "ssh_ports": str(conf.get("ssh_ports") or "22"),
     }
 
 
@@ -377,6 +639,33 @@ class Handler(BaseHTTPRequestHandler):
             except (TypeError, ValueError):
                 self._send(400, {"ok": False, "error": "interval must be 5..3600"})
                 return
+        if "auto_block" in body:
+            v = body["auto_block"]
+            if isinstance(v, str):
+                v = v.strip().lower() in ("1", "true", "yes", "on")
+            conf["auto_block"] = bool(v)
+            changed["auto_block"] = conf["auto_block"]
+        if "block_ttl" in body:
+            try:
+                v = int(body["block_ttl"])
+                if v < 0:
+                    raise ValueError
+                conf["block_ttl"] = v
+                changed["block_ttl"] = v
+            except (TypeError, ValueError):
+                self._send(400, {"ok": False, "error": "block_ttl must be >= 0"})
+                return
+        if "limit_dir" in body:
+            v = str(body["limit_dir"]).strip().lower()
+            if v not in ("sum", "rx", "tx"):
+                self._send(400, {"ok": False, "error": "limit_dir must be sum|rx|tx"})
+                return
+            conf["limit_dir"] = v
+            changed["limit_dir"] = v
+        if "ssh_ports" in body:
+            ports = parse_ports(body["ssh_ports"])
+            conf["ssh_ports"] = ",".join(ports)
+            changed["ssh_ports"] = conf["ssh_ports"]
         if not changed:
             self._send(400, {"ok": False, "error": "nothing to update"})
             return
@@ -393,6 +682,16 @@ class Handler(BaseHTTPRequestHandler):
             st = self.server.state.reset()
             log.info("当月累计已清零")
             self._send(200, {"ok": True, "month": st.get("month"), "rx_bytes": 0, "tx_bytes": 0})
+        elif path == "/block":
+            body = self._read_json()
+            ok, msg = do_block(self.server.state, self.server.conf,
+                               str(body.get("reason") or "manual"))
+            self._send(200 if ok else 500, {"ok": ok, "msg": msg,
+                                            "blocked": bool(self.server.state.snapshot().get("blocked"))})
+        elif path == "/unblock":
+            ok, msg = do_unblock(self.server.state, "api")
+            self._send(200 if ok else 500, {"ok": ok, "msg": msg,
+                                            "blocked": bool(self.server.state.snapshot().get("blocked"))})
         else:
             self._send(404, {"ok": False, "error": "not found"})
 
@@ -443,6 +742,15 @@ def main(argv=None):
     ap.add_argument("--once", action="store_true", help="采样一次并打印结果后退出")
     ap.add_argument("--print-token", action="store_true",
                     help="打印由 --token-from-agent 派生的 token 后退出")
+    ap.add_argument("--block", metavar="REASON", nargs="?", const="manual", default=None,
+                    help="立即断网（危险！会保留 --ssh-ports 指定的端口）")
+    ap.add_argument("--unblock", action="store_true", help="立即解除断网")
+    ap.add_argument("--limit-dir", choices=("sum", "rx", "tx"), default=None,
+                    help="计费方向：sum=上下行合计(默认) / tx=仅出站 / rx=仅入站")
+    ap.add_argument("--auto-block", choices=("0", "1"), default=None,
+                    help="1=超限自动断网")
+    ap.add_argument("--ssh-ports", default=None,
+                    help="断网时保留的端口，逗号分隔，默认 22")
     ap.add_argument("--debug", action="store_true")
     args = ap.parse_args(argv)
 
@@ -477,14 +785,29 @@ def main(argv=None):
         conf["interval"] = 60
     conf["interval"] = max(5, min(3600, int(conf["interval"])))
 
+    if args.limit_dir:
+        conf["limit_dir"] = args.limit_dir
+    if args.auto_block is not None:
+        conf["auto_block"] = (args.auto_block == "1")
+    if args.ssh_ports:
+        conf["ssh_ports"] = ",".join(parse_ports(args.ssh_ports))
+
     state = State()
+
+    if args.unblock:
+        ok, msg = do_unblock(state, "cli")
+        print(("[OK] " if ok else "[失败] ") + msg)
+        return 0 if ok else 1
+    if args.block:
+        save_json(CONF_FILE, conf)
+        ok, msg = do_block(state, conf, args.block)
+        print(("[OK] " if ok else "[失败] ") + msg)
+        return 0 if ok else 1
 
     if args.init or args.reset:
         st = state.init()
         print("已初始化: month=%s last_rx=%d last_tx=%d" %
               (st["month"], st["last_rx"], st["last_tx"]))
-        if not (args.init or args.reset) or sys.stdout.isatty():
-            pass
         return 0
 
     if args.once:
@@ -513,6 +836,19 @@ def main(argv=None):
 
     save_json(CONF_FILE, conf)
 
+    # 启动自检：状态文件里的 blocked 必须和防火墙实际情况一致，否则以防火墙为准
+    real_blocked = fw_active()
+    st0 = state.snapshot()
+    if bool(st0.get("blocked")) != real_blocked:
+        log.warning("状态与防火墙不一致：state.blocked=%s 实际=%s，以实际为准",
+                    bool(st0.get("blocked")), real_blocked)
+        st0["blocked"] = real_blocked
+        if not real_blocked:
+            st0["blocked_at"] = 0
+            st0["block_reason"] = ""
+            st0["block_expire"] = 0
+        state.save(st0)
+
     srv = Server((host, port), state, conf, no_auth, token)
 
     def shutdown(signum, frame):
@@ -524,10 +860,32 @@ def main(argv=None):
 
     srv.serve_forever_bg()
 
-    log.info("%s %s 已启动  监听 %s:%d  %s  采样间隔 %ss  上限 %s",
+    # TTL 看门狗：断网带 block_ttl 时，到点自动解除（防止误封导致永久失联）
+    # 解除后会把 auto_block 关掉，否则下一轮采样立刻又封上，变成封-解-封死循环。
+    def ttl_watchdog():
+        while True:
+            time.sleep(10)
+            try:
+                s = state.snapshot()
+                exp = int(s.get("block_expire") or 0)
+                if exp and s.get("blocked") and time.time() >= exp:
+                    log.warning("断网已达 TTL（%ss），自动解除", conf.get("block_ttl"))
+                    do_unblock(state, "ttl")
+                    if conf.get("auto_block"):
+                        conf["auto_block"] = False
+                        save_json(CONF_FILE, conf)
+                        log.warning("已同时关闭 auto_block，需要手动重新开启，否则会反复封禁")
+            except Exception as e:                       # noqa: BLE001
+                log.warning("TTL 看门狗异常: %s", e)
+
+    threading.Thread(target=ttl_watchdog, name="ttl", daemon=True).start()
+
+    log.info("%s %s 已启动  监听 %s:%d  %s  采样间隔 %ss  上限 %s(%s)  自动断网 %s",
              PROG, VERSION, host, port,
              "无鉴权(回环)" if no_auth else "Bearer 鉴权", conf["interval"],
-             ("%.0f GB" % conf["limit_gb"]) if conf.get("limit_gb") else "不限")
+             ("%s" % human_bytes(limit_bytes_of(conf))) if conf.get("limit_gb") else "不限",
+             conf.get("limit_dir", "sum"),
+             ("开(保留端口 %s)" % conf.get("ssh_ports")) if conf.get("auto_block") else "关")
 
     # 主循环：内部定时采样，不依赖 cron
     try:
@@ -536,6 +894,7 @@ def main(argv=None):
                 st, ifaces = state.sample()
                 log.debug("采样 month=%s rx=%s tx=%s ifaces=%d",
                           st["month"], human_bytes(st["rx"]), human_bytes(st["tx"]), len(ifaces))
+                evaluate_block(state, st, conf)
             except Exception as e:                       # noqa: BLE001
                 log.warning("采样失败: %s", e)
             time.sleep(conf["interval"])
